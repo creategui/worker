@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { calculateCourseTime } from '../src/course-time';
+import { clipTimedCourseSegment, courseSegmentDistanceM } from '../src/course-segment';
 import fixture from './fixtures/foster-city-fit.json';
 
 // Course 84 supplies the measured distance; this function is only used for
@@ -22,6 +23,13 @@ describe('Foster City Lagoon real FIT recordings', () => {
     expect(result.timeS).toBeCloseTo(expectedSeconds, 1);
     expect(result.distanceM).toBe(5100);
     expect(result.gateDiagnostics).toBeUndefined();
+
+    const segment = clipTimedCourseSegment(session.track, result.startSecond!, result.endSecond!);
+    expect(segment).not.toBeNull();
+    expect(result.endSecond! - result.startSecond!).toBeCloseTo(result.timeS, 5);
+    // This records the rowed GPS distance, not Course 84's nominal 5,100 m.
+    expect(courseSegmentDistanceM(segment!, distance)).toBeGreaterThan(4500);
+    expect(courseSegmentDistanceM(segment!, distance)).toBeLessThan(7000);
   });
 
   it('HOTD misses only the finish and qualifies for the diagnostic map', () => {

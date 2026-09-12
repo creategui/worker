@@ -43,6 +43,7 @@ Migrations live in `migrations/`:
 - `0004_standard_collections.sql` — creates `standard_collections` table
 - `0005_challenges.sql` — creates `challenges` table
 - `0006_challenge_results.sql` — creates `challenge_results` table
+- `0017_challenge_results_course_distance.sql` — adds actual scored GPS distance for new challenge submissions
 
 - **Local** (dev): `migrations apply` defaults to local. Migrations run automatically when using `npx wrangler dev`.
 - **Remote** (production): Use `--remote`:
@@ -56,6 +57,10 @@ Check pending migrations:
 ```bash
 npx wrangler d1 migrations list rowing-courses-db --remote
 ```
+
+For a release containing challenge result columns, apply the remote migration
+before deploying the Worker. This repository change does not run a remote
+migration or deploy production by itself.
 
 ### Create D1 (if missing)
 

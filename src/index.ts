@@ -1,6 +1,8 @@
 import { unzipSync } from 'fflate';
 import { kmlToCourse, haversine, type CourseFromKml } from './kml-to-course';
 import { calculateCourseTime, type TrackPoint } from './course-time';
+import { clipTimedCourseSegment, courseSegmentDistanceM } from './course-segment';
+import { preserveCourseMetricsOnMerge } from './challenge-course-metrics';
 import { computeHandicap } from './handicap';
 import {
   fetchIntervalsActivities,
@@ -2375,11 +2377,11 @@ async function handleDeleteChallenge(
 ): Promise<Response> {
   if (!env.DB) return jsonResponse({ error: 'Database not configured' }, 500, true);
 
-  const chRow = await env.DB.prepare('SELECT organizer_id, name FROM challenges WHERE id = ?')
+  const chRow = await env.DB.prepare('SELECT organizer_id, name, course_id FROM challenges WHERE id = ?')
     .bind(challengeId)
     .first();
   if (!chRow) return jsonResponse({ error: 'Challenge not found' }, 404, true);
-  const challenge = chRow as { organizer_id: string; name: string };
+  const challenge = chRow as { organizer_id: string; name: string; course_id: string | null };
   if (challenge.organizer_id !== athleteId) {
     return jsonResponse({ error: 'Not your challenge' }, 403, true);
   }
@@ -2388,14 +2390,15 @@ async function handleDeleteChallenge(
   const mergeInto = url.searchParams.get('mergeInto');
 
   if (mergeInto) {
-    const targetRow = await env.DB.prepare('SELECT organizer_id, name FROM challenges WHERE id = ?')
+    const targetRow = await env.DB.prepare('SELECT organizer_id, name, course_id FROM challenges WHERE id = ?')
       .bind(mergeInto)
       .first();
     if (!targetRow) return jsonResponse({ error: 'Target challenge not found' }, 404, true);
-    const target = targetRow as { organizer_id: string; name: string };
+    const target = targetRow as { organizer_id: string; name: string; course_id: string | null };
     if (target.organizer_id !== athleteId) {
       return jsonResponse({ error: 'Target challenge not yours' }, 403, true);
     }
+    const preserveCourseMetrics = preserveCourseMetricsOnMerge(challenge.course_id, target.course_id);
 
     const resultsRow = await env.DB.prepare('SELECT COUNT(*) as count FROM challenge_results WHERE challenge_id = ?')
       .bind(challengeId)
@@ -2410,7 +2413,7 @@ async function handleDeleteChallenge(
             raw_time_s, corrected_time_s, points, category_key, 
             boat_type, sex, weight_class, crew_avg_age, 
             start_time, validation_status, validation_note, 
-            validation_log, track_latlng, submitted_at
+            validation_log, track_latlng, course_distance_m, submitted_at
           )
           SELECT 
             id, ?, athlete_id, activity_id, display_name,
@@ -2418,7 +2421,7 @@ async function handleDeleteChallenge(
             REPLACE(category_key, ?, ?) as category_key,
             boat_type, sex, weight_class, crew_avg_age,
             start_time, validation_status, validation_note,
-            validation_log, track_latlng, submitted_at
+            validation_log, track_latlng, CASE WHEN ? THEN course_distance_m ELSE NULL END, submitted_at
           FROM challenge_results
           WHERE challenge_id = ?
           ON CONFLICT(challenge_id, athlete_id, category_key) DO UPDATE SET
@@ -2428,8 +2431,9 @@ async function handleDeleteChallenge(
             start_time = CASE WHEN excluded.raw_time_s < challenge_results.raw_time_s THEN excluded.start_time ELSE challenge_results.start_time END,
             submitted_at = CASE WHEN excluded.raw_time_s < challenge_results.raw_time_s THEN excluded.submitted_at ELSE challenge_results.submitted_at END,
             track_latlng = CASE WHEN excluded.raw_time_s < challenge_results.raw_time_s THEN excluded.track_latlng ELSE challenge_results.track_latlng END,
+            course_distance_m = CASE WHEN excluded.raw_time_s < challenge_results.raw_time_s THEN excluded.course_distance_m ELSE challenge_results.course_distance_m END,
             validation_log = CASE WHEN excluded.raw_time_s < challenge_results.raw_time_s THEN excluded.validation_log ELSE challenge_results.validation_log END
-        `).bind(mergeInto, challengeId, mergeInto, challengeId).run();
+        `).bind(mergeInto, challengeId, mergeInto, preserveCourseMetrics ? 1 : 0, challengeId).run();
       } catch (e) {
         const msg = e instanceof Error ? e.message : 'Database error during merge';
         return jsonResponse({ error: msg }, 500, true);
@@ -2590,6 +2594,7 @@ async function handleChallengeResults(challengeId: string, env: Env): Promise<Re
         crewAvgAge: row.crew_avg_age != null ? Number(row.crew_avg_age) : null,
         workoutDate,
         validationStatus: row.validation_status ?? 'valid',
+        courseDistanceM: row.course_distance_m != null ? Number(row.course_distance_m) : null,
       };
     });
     return jsonResponse({ results }, 200, true);
@@ -2696,6 +2701,11 @@ async function handleChallengeSubmit(
       validationNote: result.validationNote,
     }, 400, true);
   }
+
+  const scoredSegment = result.startSecond != null && result.endSecond != null
+    ? clipTimedCourseSegment(track, result.startSecond, result.endSecond)
+    : null;
+  const courseDistanceM = scoredSegment ? courseSegmentDistanceM(scoredSegment, haversine) : null;
 
   let intervalsMeta: IntervalsAthleteSelfMeta | undefined;
   let displayName: string | null = body.displayName?.trim() || null;
@@ -2804,8 +2814,8 @@ async function handleChallengeSubmit(
 
     const validationLogJson = JSON.stringify(validationLog);
     await env.DB.prepare(
-      `INSERT INTO challenge_results (id, challenge_id, athlete_id, activity_id, display_name, raw_time_s, corrected_time_s, points, boat_type, sex, weight_class, crew_avg_age, start_time, validation_status, validation_note, validation_log, track_latlng, submitted_at, category_key)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'valid', ?, ?, ?, ?, ?)
+      `INSERT INTO challenge_results (id, challenge_id, athlete_id, activity_id, display_name, raw_time_s, corrected_time_s, points, boat_type, sex, weight_class, crew_avg_age, start_time, validation_status, validation_note, validation_log, track_latlng, course_distance_m, submitted_at, category_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'valid', ?, ?, ?, ?, ?, ?)
        ON CONFLICT(challenge_id, athlete_id, category_key) DO UPDATE SET
          activity_id = excluded.activity_id,
          display_name = excluded.display_name,
@@ -2821,9 +2831,10 @@ async function handleChallengeSubmit(
          validation_note = excluded.validation_note,
          validation_log = excluded.validation_log,
          track_latlng = excluded.track_latlng,
+         course_distance_m = excluded.course_distance_m,
          submitted_at = excluded.submitted_at`
     )
-      .bind(id, challengeId, athleteId, activityId, displayName, result.timeS, correctedTimeS, points, boatType, sex, weightClass, crewAvgAge, startTime, validationNote, validationLogJson, trackLatlng, submittedAt, categoryKey)
+      .bind(id, challengeId, athleteId, activityId, displayName, result.timeS, correctedTimeS, points, boatType, sex, weightClass, crewAvgAge, startTime, validationNote, validationLogJson, trackLatlng, courseDistanceM, submittedAt, categoryKey)
       .run();
     const existing = await env.DB.prepare(
       'SELECT id FROM challenge_results WHERE challenge_id = ? AND athlete_id = ? AND category_key = ?'
