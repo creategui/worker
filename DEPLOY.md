@@ -44,6 +44,16 @@ Migrations live in `migrations/`:
 - `0005_challenges.sql` — creates `challenges` table
 - `0006_challenge_results.sql` — creates `challenge_results` table
 - `0017_challenge_results_course_distance.sql` — adds actual scored GPS distance for new challenge submissions
+- `0018_challenge_results_course_track.sql` — adds athlete-opted-in course-only paths for public map display
+
+Apply both migrations before deploying this Worker, then deploy the companion challenge-page UI.
+Existing results keep NULL distance/path values; this change does not backfill recordings or publish old GPS.
+New submissions always calculate `course_distance_m` from the scored GPS interval. Only a literal
+`shareCoursePath: true` saves `course_track_latlng`; omitted/false consent clears it on replacement.
+There is no separate consent column. `GET /api/challenges/:id/results` exposes `courseDistanceM`
+and `hasCourseTrack`; `GET /api/challenges/:id/results/:resultId/track` serves only the new segment
+for visible, approved results in public challenges, with `Cache-Control: no-store`.
+The existing organiser-only `track_latlng` storage and endpoint remain unchanged.
 
 - **Local** (dev): `migrations apply` defaults to local. Migrations run automatically when using `npx wrangler dev`.
 - **Remote** (production): Use `--remote`:

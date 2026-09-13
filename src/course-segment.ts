@@ -64,3 +64,28 @@ export function courseSegmentDistanceM(segment: TrackPoint[], haversine: Haversi
   }
   return Number.isFinite(distanceM) ? distanceM : null;
 }
+
+/** Keep both exact scoring endpoints when preparing the public map path. */
+export function downsampleCourseSegment(
+  segment: TrackPoint[],
+  maxPoints = 600,
+): Array<[number, number]> {
+  if (segment.length <= maxPoints) return segment.map((point) => [point.lat, point.lon]);
+  if (maxPoints < 2) return [];
+
+  const last = segment.length - 1;
+  return Array.from({ length: maxPoints }, (_, i) => {
+    const index = Math.round((i * last) / (maxPoints - 1));
+    const point = segment[index];
+    return [point.lat, point.lon] as [number, number];
+  });
+}
+
+/** Only an explicit JSON boolean true authorises public course-path storage. */
+export function storedCourseTrack(
+  segment: TrackPoint[] | null,
+  shareCoursePath: unknown,
+): string | null {
+  if (shareCoursePath !== true || !segment || segment.length < 2) return null;
+  return JSON.stringify(downsampleCourseSegment(segment));
+}

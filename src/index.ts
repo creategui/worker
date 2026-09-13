@@ -1,7 +1,7 @@
 import { unzipSync } from 'fflate';
 import { kmlToCourse, haversine, type CourseFromKml } from './kml-to-course';
 import { calculateCourseTime, type TrackPoint } from './course-time';
-import { clipTimedCourseSegment, courseSegmentDistanceM } from './course-segment';
+import { clipTimedCourseSegment, courseSegmentDistanceM, storedCourseTrack } from './course-segment';
 import { preserveCourseMetricsOnMerge } from './challenge-course-metrics';
 import { computeHandicap } from './handicap';
 import {
@@ -602,6 +602,16 @@ export default {
       return withCors(await handleListChallenges(validStatus, env), request);
     }
 
+    // GET /api/challenges/:challengeId/results/:resultId/track — opted-in course segment only
+    const challengeResultTrackMatch = path.match(/^\/api\/challenges\/([^/]+)\/results\/([^/]+)\/track\/?$/);
+    if (challengeResultTrackMatch && request.method === 'GET') {
+      return withCors(await handlePublicChallengeResultTrack(
+        challengeResultTrackMatch[1],
+        challengeResultTrackMatch[2],
+        env,
+      ), request);
+    }
+
     // GET /api/challenges/:id/results
     const challengeResultsMatch = path.match(/^\/api\/challenges\/([^/]+)\/results\/?$/);
     if (challengeResultsMatch && request.method === 'GET') {
@@ -1163,6 +1173,13 @@ function jsonResponse(body: object, status: number, withCors = false, request?: 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (withCors) Object.assign(headers, corsHeaders(request ?? new Request('http://x')));
   return new Response(JSON.stringify(body), { status, headers });
+}
+
+function noStoreJsonResponse(body: object, status: number): Response {
+  const response = jsonResponse(body, status, true);
+  const headers = new Headers(response.headers);
+  headers.set('Cache-Control', 'no-store');
+  return new Response(response.body, { status: response.status, headers });
 }
 
 interface Manifest {
@@ -2413,15 +2430,16 @@ async function handleDeleteChallenge(
             raw_time_s, corrected_time_s, points, category_key, 
             boat_type, sex, weight_class, crew_avg_age, 
             start_time, validation_status, validation_note, 
-            validation_log, track_latlng, course_distance_m, submitted_at
+            validation_log, track_latlng, course_distance_m, course_track_latlng, submitted_at
           )
-          SELECT 
-            id, ?, athlete_id, activity_id, display_name,
+          SELECT
+            lower(hex(randomblob(16))), ?, athlete_id, activity_id, display_name,
             raw_time_s, corrected_time_s, points, 
             REPLACE(category_key, ?, ?) as category_key,
             boat_type, sex, weight_class, crew_avg_age,
             start_time, validation_status, validation_note,
-            validation_log, track_latlng, CASE WHEN ? THEN course_distance_m ELSE NULL END, submitted_at
+            validation_log, track_latlng, CASE WHEN ? THEN course_distance_m ELSE NULL END,
+            CASE WHEN ? THEN course_track_latlng ELSE NULL END, submitted_at
           FROM challenge_results
           WHERE challenge_id = ?
           ON CONFLICT(challenge_id, athlete_id, category_key) DO UPDATE SET
@@ -2432,8 +2450,9 @@ async function handleDeleteChallenge(
             submitted_at = CASE WHEN excluded.raw_time_s < challenge_results.raw_time_s THEN excluded.submitted_at ELSE challenge_results.submitted_at END,
             track_latlng = CASE WHEN excluded.raw_time_s < challenge_results.raw_time_s THEN excluded.track_latlng ELSE challenge_results.track_latlng END,
             course_distance_m = CASE WHEN excluded.raw_time_s < challenge_results.raw_time_s THEN excluded.course_distance_m ELSE challenge_results.course_distance_m END,
+            course_track_latlng = CASE WHEN excluded.raw_time_s < challenge_results.raw_time_s THEN excluded.course_track_latlng ELSE challenge_results.course_track_latlng END,
             validation_log = CASE WHEN excluded.raw_time_s < challenge_results.raw_time_s THEN excluded.validation_log ELSE challenge_results.validation_log END
-        `).bind(mergeInto, challengeId, mergeInto, preserveCourseMetrics ? 1 : 0, challengeId).run();
+        `).bind(mergeInto, challengeId, mergeInto, preserveCourseMetrics ? 1 : 0, preserveCourseMetrics ? 1 : 0, challengeId).run();
       } catch (e) {
         const msg = e instanceof Error ? e.message : 'Database error during merge';
         return jsonResponse({ error: msg }, 500, true);
@@ -2595,12 +2614,47 @@ async function handleChallengeResults(challengeId: string, env: Env): Promise<Re
         workoutDate,
         validationStatus: row.validation_status ?? 'valid',
         courseDistanceM: row.course_distance_m != null ? Number(row.course_distance_m) : null,
+        hasCourseTrack: row.course_track_latlng != null,
       };
     });
     return jsonResponse({ results }, 200, true);
   } catch (e) {
     const msg = e instanceof Error ? e.message : 'Database error';
     return jsonResponse({ error: msg }, 500, true);
+  }
+}
+
+async function handlePublicChallengeResultTrack(
+  challengeId: string,
+  resultId: string,
+  env: Env,
+): Promise<Response> {
+  if (!env.DB) return noStoreJsonResponse({ error: 'Database not configured' }, 500);
+  const removed = await getRemovedChallengeIds(env);
+  if (removed.has(challengeId)) return noStoreJsonResponse({ error: 'Not found' }, 404);
+
+  try {
+    const row = await env.DB.prepare(
+      `SELECT cr.course_track_latlng
+       FROM challenge_results cr
+       JOIN challenges c ON c.id = cr.challenge_id
+       WHERE cr.id = ?
+         AND cr.challenge_id = ?
+         AND cr.validation_status IN ('valid', 'manual_ok')
+         AND c.is_public = 1
+         AND c.is_deleted = 0`,
+    ).bind(resultId, challengeId).first();
+    if (!row) return noStoreJsonResponse({ error: 'Not found' }, 404);
+
+    const raw = (row as { course_track_latlng: string | null }).course_track_latlng;
+    if (!raw) return noStoreJsonResponse({ error: 'Not found' }, 404);
+    const latlng = JSON.parse(raw) as unknown;
+    if (!Array.isArray(latlng) || latlng.length < 2) return noStoreJsonResponse({ error: 'Not found' }, 404);
+    return noStoreJsonResponse({ latlng }, 200);
+  } catch {
+    // Treat malformed or unavailable public paths as unavailable; never expose
+    // the organiser-only whole-workout track as a fallback.
+    return noStoreJsonResponse({ error: 'Not found' }, 404);
   }
 }
 
@@ -2616,7 +2670,7 @@ async function handleChallengeSubmit(
   const removed = await getRemovedChallengeIds(env);
   if (removed.has(challengeId)) return jsonResponse({ error: 'Not found' }, 404, true);
 
-  let body: { activityId?: string; displayName?: string; boatType?: string; sex?: string; weightClass?: string; crewAvgAge?: number };
+  let body: { activityId?: string; displayName?: string; boatType?: string; sex?: string; weightClass?: string; crewAvgAge?: number; shareCoursePath?: boolean };
   try {
     body = (await request.json()) as typeof body;
   } catch {
@@ -2706,6 +2760,7 @@ async function handleChallengeSubmit(
     ? clipTimedCourseSegment(track, result.startSecond, result.endSecond)
     : null;
   const courseDistanceM = scoredSegment ? courseSegmentDistanceM(scoredSegment, haversine) : null;
+  const courseTrackLatlng = storedCourseTrack(scoredSegment, body.shareCoursePath);
 
   let intervalsMeta: IntervalsAthleteSelfMeta | undefined;
   let displayName: string | null = body.displayName?.trim() || null;
@@ -2814,8 +2869,8 @@ async function handleChallengeSubmit(
 
     const validationLogJson = JSON.stringify(validationLog);
     await env.DB.prepare(
-      `INSERT INTO challenge_results (id, challenge_id, athlete_id, activity_id, display_name, raw_time_s, corrected_time_s, points, boat_type, sex, weight_class, crew_avg_age, start_time, validation_status, validation_note, validation_log, track_latlng, course_distance_m, submitted_at, category_key)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'valid', ?, ?, ?, ?, ?, ?)
+      `INSERT INTO challenge_results (id, challenge_id, athlete_id, activity_id, display_name, raw_time_s, corrected_time_s, points, boat_type, sex, weight_class, crew_avg_age, start_time, validation_status, validation_note, validation_log, track_latlng, course_distance_m, course_track_latlng, submitted_at, category_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'valid', ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(challenge_id, athlete_id, category_key) DO UPDATE SET
          activity_id = excluded.activity_id,
          display_name = excluded.display_name,
@@ -2832,9 +2887,10 @@ async function handleChallengeSubmit(
          validation_log = excluded.validation_log,
          track_latlng = excluded.track_latlng,
          course_distance_m = excluded.course_distance_m,
+         course_track_latlng = excluded.course_track_latlng,
          submitted_at = excluded.submitted_at`
     )
-      .bind(id, challengeId, athleteId, activityId, displayName, result.timeS, correctedTimeS, points, boatType, sex, weightClass, crewAvgAge, startTime, validationNote, validationLogJson, trackLatlng, courseDistanceM, submittedAt, categoryKey)
+      .bind(id, challengeId, athleteId, activityId, displayName, result.timeS, correctedTimeS, points, boatType, sex, weightClass, crewAvgAge, startTime, validationNote, validationLogJson, trackLatlng, courseDistanceM, courseTrackLatlng, submittedAt, categoryKey)
       .run();
     const existing = await env.DB.prepare(
       'SELECT id FROM challenge_results WHERE challenge_id = ? AND athlete_id = ? AND category_key = ?'

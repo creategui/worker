@@ -1,4 +1,6 @@
-import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
+import { defineWorkersConfig, readD1Migrations } from '@cloudflare/vitest-pool-workers/config';
+
+const testMigrations = await readD1Migrations('./migrations');
 
 export default defineWorkersConfig({
 	test: {
@@ -19,6 +21,7 @@ export default defineWorkersConfig({
 			workers: {
 				wrangler: { configPath: './wrangler.jsonc' },
 				miniflare: {
+					bindings: { TEST_MIGRATIONS: testMigrations },
 					vars: {
 						GITHUB_REPO: 'rownative/courses',
 						INTERVALS_CLIENT_ID: 'test-client-id',
