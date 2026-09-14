@@ -303,13 +303,17 @@ export function calculateCourseTime(
     const firstResult = coursetimeFirst(sliced, polygons);
     // Rowsandall: net = coursetime_paths - coursetime_first
     const netTime = pathsResult.time - firstResult.time;
+    // Use the same firstResult as scoring. startT is only the candidate used
+    // to construct the 10-second validation window and can differ from the
+    // actual scored start when two start passages are close together.
+    const startS = firstResult.time + sliceStart;
     const endS = pathsResult.time + sliceStart;
     const dist = pathsResult.time > 0 ? (pathsResult.dist || 0) : 0;
     records.push({
       netTime,
       dist,
       completed: pathsResult.completed,
-      startS: startT,
+      startS,
       endS,
     });
     note.push(
